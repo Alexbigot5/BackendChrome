@@ -1,10 +1,19 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../index');
-const { runApify } = require('../helpers/apify');
+const { pool } = require('../db');
+const { scrapeCreator } = require('../helpers/apify');
 const { appendToSheet } = require('../helpers/sheets');
+const { computeMatchScore } = require('../helpers/matchScore');
+const { rateLimit } = require('../middleware/rateLimit');
 
 const SUPPORTED_PLATFORMS = ['tiktok', 'instagram'];
+
+// ─── Rate limit: 10 saves per minute per token ─────────────────────────────
+router.use(rateLimit({
+  windowMs: 60_000,
+  max: 10,
+  keyFn: (req) => req.body?.token || req.ip,
+}));
 
 // POST /save
 // Body: { token, handle, platform }
@@ -19,11 +28,11 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: `platform must be one of: ${SUPPORTED_PLATFORMS.join(', ')}` });
   }
 
-  // Validate token and fetch user
+  // ─── Validate token and fetch user ────────────────────────────────────────
   let user;
   try {
     const result = await pool.query(
-      'SELECT id, email, sheet_id, active FROM users WHERE token = $1',
+      'SELECT id, email, sheet_id, active, stripe_subscription_id FROM users WHERE token = $1',
       [token]
     );
 
@@ -45,16 +54,63 @@ router.post('/', async (req, res) => {
     return res.status(500).json({ error: 'Failed to validate token' });
   }
 
-  // Run Apify scraper
+  // ─── Check plan-based usage limits ────────────────────────────────────────
+  try {
+    const usageResult = await pool.query(
+      `SELECT COUNT(*) AS saves_this_month
+       FROM scrape_log
+       WHERE user_id = $1
+         AND created_at >= date_trunc('month', NOW())`,
+      [user.id]
+    );
+
+    const savesThisMonth = parseInt(usageResult.rows[0].saves_this_month, 10);
+    const planLimit = user.stripe_subscription_id ? 2000 : 5;
+    // TODO: differentiate Starter ($10/2000) vs Pro ($29/unlimited)
+
+    if (savesThisMonth >= planLimit) {
+      return res.status(429).json({
+        error: 'Monthly save limit reached. Upgrade your plan for more saves.',
+        savesThisMonth,
+        limit: planLimit,
+      });
+    }
+  } catch (err) {
+    console.error('[SAVE] Usage check error:', err.message);
+  }
+
+  // ─── Fetch user's campaign brief preferences ─────────────────────────────
+  let brief = null;
+  try {
+    const prefResult = await pool.query(
+      'SELECT * FROM user_preferences WHERE user_id = $1',
+      [user.id]
+    );
+    if (prefResult.rows.length > 0) {
+      brief = prefResult.rows[0];
+    }
+  } catch (err) {
+    console.error('[SAVE] Failed to load brief preferences:', err.message);
+  }
+
+  // ─── Run Apify scraper ────────────────────────────────────────────────────
   let scrapedData;
   try {
-    scrapedData = await runApify(platform, handle);
+    scrapedData = await scrapeCreator(platform, handle);
   } catch (err) {
     console.error(`[SAVE] Apify error for ${platform}/${handle}:`, err.message);
     return res.status(502).json({ error: `Scraper failed: ${err.message}` });
   }
 
-  // Write results to Google Sheet
+  // ─── Compute match score ──────────────────────────────────────────────────
+  const matchScore = computeMatchScore(scrapedData, brief);
+  scrapedData.matchScore = matchScore;
+
+  if (matchScore !== null) {
+    console.log(`[SCORE] @${handle} scored ${matchScore}% against ${user.email}'s brief`);
+  }
+
+  // ─── Write results to Google Sheet ────────────────────────────────────────
   try {
     await appendToSheet(user.sheet_id, handle, platform, scrapedData);
   } catch (err) {
@@ -62,7 +118,17 @@ router.post('/', async (req, res) => {
     return res.status(502).json({ error: 'Failed to write to Google Sheet' });
   }
 
-  console.log(`[SAVE] ${user.email} saved @${handle} (${platform})`);
+  // ─── Log the save to scrape_log ───────────────────────────────────────────
+  try {
+    await pool.query(
+      'INSERT INTO scrape_log (user_id, handle, platform) VALUES ($1, $2, $3)',
+      [user.id, handle, platform]
+    );
+  } catch (err) {
+    console.error('[SAVE] Failed to log scrape:', err.message);
+  }
+
+  console.log(`[SAVE] ${user.email} saved @${handle} (${platform}) — score: ${matchScore ?? 'N/A'}%`);
   return res.json({ success: true, data: scrapedData });
 });
 

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Stripe = require('stripe');
 const crypto = require('crypto');
-const { pool } = require('../index');
+const { pool } = require('../db');
 const { provisionSheet } = require('../helpers/sheets');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);

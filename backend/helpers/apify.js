@@ -151,4 +151,86 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { runApify };
+async function runRapidAPI(platform, handle) {
+  const key = process.env.RAPIDAPI_KEY;
+  if (!key) throw new Error('RAPIDAPI_KEY not set');
+
+  if (platform === 'tiktok') {
+    const response = await axios.get(
+      'https://tiktok-api6.p.rapidapi.com/user/info',
+      {
+        params: { unique_id: handle },
+        headers: {
+          'X-RapidAPI-Key': key,
+          'X-RapidAPI-Host': 'tiktok-api6.p.rapidapi.com'
+        }
+      }
+    );
+    const user = response.data?.userInfo?.user;
+    const stats = response.data?.userInfo?.stats;
+    if (!user) throw new Error('RapidAPI returned no TikTok data');
+
+    const followers = stats?.followerCount ?? null;
+    const hearts = stats?.heartCount ?? null;
+    const videos = stats?.videoCount ?? null;
+    let engagementRate = null;
+    if (followers && hearts && videos && videos > 0) {
+      engagementRate = ((hearts / videos / followers) * 100).toFixed(2) + '%';
+    }
+
+    return {
+      followers,
+      engagementRate,
+      niche: null,
+      location: null,
+      bio: user.signature ?? null,
+      matchScore: null,
+    };
+  }
+
+  if (platform === 'instagram') {
+    const response = await axios.get(
+      'https://instagram-scraper-api2.p.rapidapi.com/v1/info',
+      {
+        params: { username_or_id_or_url: handle },
+        headers: {
+          'X-RapidAPI-Key': key,
+          'X-RapidAPI-Host': 'instagram-scraper-api2.p.rapidapi.com'
+        }
+      }
+    );
+    const user = response.data?.data;
+    if (!user) throw new Error('RapidAPI returned no Instagram data');
+
+    const followers = user.follower_count ?? null;
+    const avgLikes = user.avg_like_count ?? null;
+    let engagementRate = null;
+    if (followers && avgLikes) {
+      engagementRate = ((avgLikes / followers) * 100).toFixed(2) + '%';
+    }
+
+    return {
+      followers,
+      engagementRate,
+      niche: user.category ?? null,
+      location: user.city_name ?? null,
+      bio: user.biography ?? null,
+      matchScore: null,
+    };
+  }
+
+  throw new Error(`RapidAPI: unsupported platform ${platform}`);
+}
+
+async function scrapeCreator(platform, handle) {
+  try {
+    console.log(`[SCRAPE] Trying Apify for ${platform}/@${handle}`);
+    return await runApify(platform, handle);
+  } catch (err) {
+    console.warn(`[SCRAPE] Apify failed for ${platform}/@${handle}: ${err.message}`);
+    console.log(`[SCRAPE] Falling back to RapidAPI for ${platform}/@${handle}`);
+    return await runRapidAPI(platform, handle);
+  }
+}
+
+module.exports = { scrapeCreator, runApify };

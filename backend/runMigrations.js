@@ -2,8 +2,10 @@ require('dotenv').config();
 
 const { Pool } = require('pg');
 const migration001 = require('./migrations/001_create_users_table');
+const migration002 = require('./migrations/002_create_preferences_table');
+const migration003 = require('./migrations/003_create_scrape_log');
 
-const migrations = [migration001];
+const migrations = [migration001, migration002, migration003];
 
 async function runMigrations() {
   const pool = new Pool({

@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../index');
+const { pool } = require('../db');
 
 // POST /onboarding
 // Body: { token, platforms, fields, sheetOption, brief }
