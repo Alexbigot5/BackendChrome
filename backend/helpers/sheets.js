@@ -38,7 +38,37 @@ function extractPem(raw) {
 
   // Rebuild clean PEM with exactly 64-char lines
   const lines = (base64.match(/.{1,64}/g) || []).join('\n');
-  return '-----BEGIN ' + keyType + '-----\n' + lines + '\n-----END ' + keyType + '-----\n';
+  return { pem: '-----BEGIN ' + keyType + '-----\n' + lines + '\n-----END ' + keyType + '-----\n', keyType, base64 };
+}
+
+function loadPrivateKey(raw) {
+  const { pem, keyType, base64 } = extractPem(raw);
+
+  if (keyType === 'RSA PRIVATE KEY') {
+    // PKCS#1 â forge handles directly
+    return forge.pki.privateKeyFromPem(pem);
+  }
+
+  // PKCS#8 â forge.pki.privateKeyFromPem sometimes chokes on it with
+  // "Unparsed DER bytes remain after ASN.1 sequence". Manually unwrap instead.
+  try {
+    const der = forge.util.decode64(base64);
+    const asn1 = forge.asn1.fromDer(der, { strict: false });
+    // PKCS#8 PrivateKeyInfo: SEQUENCE { version INTEGER, AlgorithmIdentifier SEQUENCE, privateKey OCTET STRING }
+    const privateKeyOctet = asn1.value[2];
+    if (!privateKeyOctet || privateKeyOctet.type !== forge.asn1.Type.OCTETSTRING) {
+      throw new Error('Expected OCTET STRING at index 2 of PKCS#8 structure, got: ' + (privateKeyOctet && privateKeyOctet.type));
+    }
+    const rsaKeyAsn1 = forge.asn1.fromDer(privateKeyOctet.value, { strict: false });
+    return forge.pki.privateKeyFromAsn1(rsaKeyAsn1);
+  } catch (e) {
+    // Last resort: try parsing the PEM directly
+    try {
+      return forge.pki.privateKeyFromPem(pem);
+    } catch (e2) {
+      throw new Error('loadPrivateKey failed. PKCS#8 unwrap: ' + e.message + ' | direct PEM: ' + e2.message);
+    }
+  }
 }
 
 async function getAccessToken() {
@@ -47,13 +77,7 @@ async function getAccessToken() {
   if (!raw) throw new Error('GOOGLE_PRIVATE_KEY env var is missing');
   if (!serviceAccountEmail) throw new Error('GOOGLE_SERVICE_ACCOUNT_EMAIL env var is missing');
 
-  const keyPem = extractPem(raw);
-  let privateKey;
-  try {
-    privateKey = forge.pki.privateKeyFromPem(keyPem);
-  } catch (err) {
-    throw new Error('forge.pki.privateKeyFromPem failed: ' + err.message + ' | PEM start: ' + keyPem.slice(0, 80));
-  }
+  const privateKey = loadPrivateKey(raw);
 
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: 'RS256', typ: 'JWT' };
