@@ -1,4 +1,4 @@
-const { google } = require('googleapis');
+const crypto = require('crypto');
 
 const SHEET_HEADERS = [
   'Handle',
@@ -11,18 +11,40 @@ const SHEET_HEADERS = [
   'Date Saved',
 ];
 
-function getAuthClient() {
-  const privateKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-  return new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: privateKey,
-    },
-    scopes: [
-      'https://www.googleapis.com/auth/spreadsheets',
-      'https://www.googleapis.com/auth/drive',
-    ],
+/**
+ * Creates a short-lived Google OAuth2 access token using a service account
+ * JWT, signed with Node.js built-in crypto (OpenSSL 3 compatible).
+ */
+async function getAccessToken() {
+  const privateKeyPem = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+  const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    iss: serviceAccountEmail,
+    scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now,
+  })).toString('base64url');
+
+  const toSign = `${header}.${payload}`;
+  const privateKey = crypto.createPrivateKey(privateKeyPem);
+  const signature = crypto.sign('SHA256', Buffer.from(toSign), privateKey).toString('base64url');
+  const jwt = `${toSign}.${signature}`;
+
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
   });
+
+  const data = await resp.json();
+  if (!data.access_token) {
+    throw new Error('Failed to get access token: ' + JSON.stringify(data));
+  }
+  return data.access_token;
 }
 
 /**
@@ -30,107 +52,67 @@ function getAuthClient() {
  * with the user's email, and returns { sheetId, sheetUrl }.
  */
 async function provisionSheet(email) {
-  const auth = getAuthClient();
-  const sheets = google.sheets({ version: 'v4', auth });
-  const drive = google.drive({ version: 'v3', auth });
+  const token = await getAccessToken();
+  const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
-  // Create the spreadsheet
-  const createResponse = await sheets.spreadsheets.create({
-    requestBody: {
-      properties: {
-        title: `LiveChrome — ${email}`,
-      },
-      sheets: [
-        {
-          properties: { title: 'Creators' },
+  // 1. Create spreadsheet
+  const createResp = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      properties: { title: `LiveChrome Creators \u2014 ${email}` },
+      sheets: [{ properties: { title: 'Creators' } }],
+    }),
+  });
+  const sheet = await createResp.json();
+  if (!sheet.spreadsheetId) throw new Error('Create sheet failed: ' + JSON.stringify(sheet));
+  const id = sheet.spreadsheetId;
+
+  // 2. Write header row
+  await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/Creators!A1:H1?valueInputOption=RAW`,
+    { method: 'PUT', headers: auth, body: JSON.stringify({ values: [SHEET_HEADERS] }) }
+  );
+
+  // 3. Bold the header row
+  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({
+      requests: [{
+        repeatCell: {
+          range: { sheetId: 0, startRowIndex: 0, endRowIndex: 1 },
+          cell: { userEnteredFormat: { textFormat: { bold: true } } },
+          fields: 'userEnteredFormat.textFormat.bold',
         },
-      ],
-    },
+      }],
+    }),
   });
 
-  const sheetId = createResponse.data.spreadsheetId;
-  const sheetUrl = createResponse.data.spreadsheetUrl;
-
-  // Write header row
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: sheetId,
-    range: 'Creators!A1',
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [SHEET_HEADERS],
-    },
+  // 4. Share with user (writer access)
+  await fetch(`https://www.googleapis.com/drive/v3/files/${id}/permissions`, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ role: 'writer', type: 'user', emailAddress: email }),
   });
 
-  // Bold + freeze header row for readability
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: sheetId,
-    requestBody: {
-      requests: [
-        {
-          repeatCell: {
-            range: { sheetId: 0, startRowIndex: 0, endRowIndex: 1 },
-            cell: {
-              userEnteredFormat: {
-                textFormat: { bold: true },
-                backgroundColor: { red: 0.2, green: 0.2, blue: 0.2 },
-                foregroundColor: { red: 1, green: 1, blue: 1 },
-              },
-            },
-            fields: 'userEnteredFormat(textFormat,backgroundColor,foregroundColor)',
-          },
-        },
-        {
-          updateSheetProperties: {
-            properties: { sheetId: 0, gridProperties: { frozenRowCount: 1 } },
-            fields: 'gridProperties.frozenRowCount',
-          },
-        },
-      ],
-    },
-  });
-
-  // Share the sheet with the user (writer access so they can view)
-  await drive.permissions.create({
-    fileId: sheetId,
-    requestBody: {
-      type: 'user',
-      role: 'writer',
-      emailAddress: email,
-    },
-    sendNotificationEmail: true,
-  });
-
-  return { sheetId, sheetUrl };
+  return {
+    sheetId: id,
+    sheetUrl: `https://docs.google.com/spreadsheets/d/${id}/edit`,
+  };
 }
 
 /**
- * Appends a row of scraped creator data to the user's sheet.
- * scrapedData should contain fields matching SHEET_HEADERS.
+ * Appends a row of creator data to an existing sheet.
  */
-async function appendToSheet(sheetId, handle, platform, scrapedData) {
-  const auth = getAuthClient();
-  const sheets = google.sheets({ version: 'v4', auth });
-
-  const row = [
-    handle,
-    scrapedData.followers ?? '',
-    scrapedData.engagementRate ?? '',
-    scrapedData.niche ?? '',
-    scrapedData.location ?? '',
-    scrapedData.bio ?? '',
-    scrapedData.matchScore ?? '',
-    new Date().toISOString().split('T')[0],
-  ];
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
-    range: 'Creators!A1',
-    valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: {
-      values: [row],
-    },
-  });
+async function appendToSheet(sheetId, rowData) {
+  const token = await getAccessToken();
+  const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const values = SHEET_HEADERS.map((h) => rowData[h] || '');
+  await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Creators!A:H:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    { method: 'POST', headers: auth, body: JSON.stringify({ values: [values] }) }
+  );
 }
 
 module.exports = { provisionSheet, appendToSheet };
