@@ -1,21 +1,17 @@
 const { google } = require('googleapis');
 
 function getAuth() {
-  const privateKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-  const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
 
-  if (!privateKey) throw new Error('GOOGLE_PRIVATE_KEY env var is missing');
-  if (!clientEmail) throw new Error('GOOGLE_SERVICE_ACCOUNT_EMAIL env var is missing');
+  if (!clientId) throw new Error('GOOGLE_CLIENT_ID env var is missing');
+  if (!clientSecret) throw new Error('GOOGLE_CLIENT_SECRET env var is missing');
+  if (!refreshToken) throw new Error('GOOGLE_REFRESH_TOKEN env var is missing');
 
-  return new google.auth.JWT(
-    clientEmail,
-    null,
-    privateKey,
-    [
-      'https://www.googleapis.com/auth/spreadsheets',
-      'https://www.googleapis.com/auth/drive',
-    ]
-  );
+  const auth = new google.auth.OAuth2(clientId, clientSecret);
+  auth.setCredentials({ refresh_token: refreshToken });
+  return auth;
 }
 
 async function provisionSheet(userEmail) {
@@ -35,7 +31,7 @@ async function provisionSheet(userEmail) {
     spreadsheetId = createResp.data.spreadsheetId;
     if (!spreadsheetId) throw new Error('No spreadsheetId in response');
   } catch (err) {
-    console.error('Full sheets create error:', JSON.stringify(err?.response?.data || err.message));
+    console.error('Sheets create error:', JSON.stringify(err?.response?.data || err.message));
     throw new Error('Failed to create sheet: ' + JSON.stringify(err?.response?.data || err.message));
   }
 
