@@ -24,7 +24,12 @@ router.post('/', async (req, res) => {
   
     try {
           const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-          const { sub: clerkUserId } = await clerk.verifyToken(sessionToken);
+          const { sub: clerkUserId } = await clerk.verifyToken(sessionToken, {
+  authorizedParties: [
+    'https://chromefrontend.vercel.app',
+    'http://localhost:5173',
+  ],
+});
           const clerkUser = await clerk.users.getUser(clerkUserId);
           const primary = clerkUser.emailAddresses.find(
                   (e) => e.id === clerkUser.primaryEmailAddressId
