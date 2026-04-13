@@ -67,9 +67,18 @@ async function provisionSheet(userEmail) {
   return { sheetId: spreadsheetId, sheetUrl };
 }
 
-async function appendToSheet(spreadsheetId, row) {
+async function appendToSheet(spreadsheetId, handle, platform, data) {
   const auth = getAuth();
   const sheets = google.sheets({ version: 'v4', auth });
+
+  const row = [
+    handle,
+    data?.followers ?? '',
+    data?.following ?? '',
+    data?.likes ?? '',
+    data?.videos ?? '',
+    new Date().toISOString(),
+  ];
 
   await sheets.spreadsheets.values.append({
     spreadsheetId,
