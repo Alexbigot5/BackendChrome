@@ -12,18 +12,17 @@ const SHEET_HEADERS = [
 ];
 
 function getAuthClient() {
-  // GOOGLE_PRIVATE_KEY is stored with literal \n in env — replace them
   const privateKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-
-  return new google.auth.JWT(
-    process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    null,
-    privateKey,
-    [
+  return new google.auth.GoogleAuth({
+    credentials: {
+      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      private_key: privateKey,
+    },
+    scopes: [
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive',
-    ]
-  );
+    ],
+  });
 }
 
 /**
