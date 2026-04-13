@@ -103,9 +103,10 @@ async function getAccessToken() {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: 'grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=' + jwt,
   });
-  const data = await resp.json();
-  if (!data.access_token) throw new Error('Token exchange failed: ' + JSON.stringify(data));
-  return data.access_token;
+const data = await resp.json();
+console.log('Token exchange response:', JSON.stringify(data));
+if (!data.access_token) throw new Error('Token exchange failed: ' + JSON.stringify(data));
+return data.access_token;
 }
 
 async function provisionSheet(userEmail) {
