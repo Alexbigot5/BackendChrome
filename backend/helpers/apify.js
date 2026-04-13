@@ -9,10 +9,6 @@ const ACTORS = {
   instagram: 'apify/instagram-scraper',
 };
 
-/**
- * Builds the actor input payload for each platform.
- * Adjust field names as needed if the actor API changes.
- */
 function buildInput(platform, handle) {
   if (platform === 'tiktok') {
     return {
@@ -32,14 +28,12 @@ function buildInput(platform, handle) {
   throw new Error(`Unsupported platform: ${platform}`);
 }
 
-/**
- * Normalises a raw Apify item into the shape expected by appendToSheet.
- */
 function normaliseResult(platform, item) {
   if (platform === 'tiktok') {
     const followerCount = item.fans ?? item.followerCount ?? item.stats?.followerCount ?? null;
-    const heartCount = item.heart ?? item.stats?.heartCount ?? null;
-    const videoCount = item.video ?? item.stats?.videoCount ?? null;
+    const followingCount = item.following ?? item.stats?.followingCount ?? null;
+    const heartCount = item.heart ?? item.heartCount ?? item.stats?.heartCount ?? null;
+    const videoCount = item.video ?? item.videoCount ?? item.stats?.videoCount ?? null;
 
     let engagementRate = null;
     if (followerCount && heartCount && videoCount && videoCount > 0) {
@@ -48,6 +42,9 @@ function normaliseResult(platform, item) {
 
     return {
       followers: followerCount,
+      following: followingCount,
+      likes: heartCount,
+      videos: videoCount,
       engagementRate,
       niche: item.category ?? null,
       location: item.region ?? item.location ?? null,
@@ -58,6 +55,7 @@ function normaliseResult(platform, item) {
 
   if (platform === 'instagram') {
     const followers = item.followersCount ?? item.followedByCount ?? null;
+    const following = item.followsCount ?? item.followingCount ?? null;
     const mediaCount = item.postsCount ?? item.mediaCount ?? null;
     const avgLikes = item.avgLikesCount ?? null;
 
@@ -68,6 +66,9 @@ function normaliseResult(platform, item) {
 
     return {
       followers,
+      following,
+      likes: avgLikes,
+      videos: mediaCount,
       engagementRate,
       niche: item.category ?? null,
       location: item.city ?? item.country ?? null,
@@ -79,10 +80,6 @@ function normaliseResult(platform, item) {
   return {};
 }
 
-/**
- * Starts an Apify actor run, polls until complete (or timeout), then fetches
- * the first dataset item and returns a normalised result object.
- */
 async function runApify(platform, handle) {
   const actor = ACTORS[platform];
   if (!actor) throw new Error(`No Apify actor configured for platform: ${platform}`);
@@ -90,7 +87,6 @@ async function runApify(platform, handle) {
   const token = process.env.APIFY_API_TOKEN;
   const input = buildInput(platform, handle);
 
-  // Start the run
   const startResponse = await axios.post(
     `${APIFY_BASE}/acts/${encodeURIComponent(actor)}/runs`,
     input,
@@ -105,7 +101,6 @@ async function runApify(platform, handle) {
 
   console.log(`[APIFY] Started run ${runId} for ${platform}/@${handle}`);
 
-  // Poll until SUCCEEDED or timeout
   const deadline = Date.now() + MAX_POLL_MS;
   let status = 'RUNNING';
 
@@ -130,7 +125,6 @@ async function runApify(platform, handle) {
     throw new Error(`Apify run timed out after ${MAX_POLL_MS / 1000}s`);
   }
 
-  // Fetch dataset items
   const datasetId = (
     await axios.get(`${APIFY_BASE}/actor-runs/${runId}`, { params: { token } })
   ).data?.data?.defaultDatasetId;
@@ -162,8 +156,8 @@ async function runRapidAPI(platform, handle) {
         params: { unique_id: handle },
         headers: {
           'X-RapidAPI-Key': key,
-          'X-RapidAPI-Host': 'tiktok-api6.p.rapidapi.com'
-        }
+          'X-RapidAPI-Host': 'tiktok-api6.p.rapidapi.com',
+        },
       }
     );
     const user = response.data?.userInfo?.user;
@@ -171,8 +165,10 @@ async function runRapidAPI(platform, handle) {
     if (!user) throw new Error('RapidAPI returned no TikTok data');
 
     const followers = stats?.followerCount ?? null;
+    const following = stats?.followingCount ?? null;
     const hearts = stats?.heartCount ?? null;
     const videos = stats?.videoCount ?? null;
+
     let engagementRate = null;
     if (followers && hearts && videos && videos > 0) {
       engagementRate = ((hearts / videos / followers) * 100).toFixed(2) + '%';
@@ -180,6 +176,9 @@ async function runRapidAPI(platform, handle) {
 
     return {
       followers,
+      following,
+      likes: hearts,
+      videos,
       engagementRate,
       niche: null,
       location: null,
@@ -195,15 +194,18 @@ async function runRapidAPI(platform, handle) {
         params: { username_or_id_or_url: handle },
         headers: {
           'X-RapidAPI-Key': key,
-          'X-RapidAPI-Host': 'instagram-scraper-api2.p.rapidapi.com'
-        }
+          'X-RapidAPI-Host': 'instagram-scraper-api2.p.rapidapi.com',
+        },
       }
     );
     const user = response.data?.data;
     if (!user) throw new Error('RapidAPI returned no Instagram data');
 
     const followers = user.follower_count ?? null;
+    const following = user.following_count ?? null;
     const avgLikes = user.avg_like_count ?? null;
+    const mediaCount = user.media_count ?? null;
+
     let engagementRate = null;
     if (followers && avgLikes) {
       engagementRate = ((avgLikes / followers) * 100).toFixed(2) + '%';
@@ -211,6 +213,9 @@ async function runRapidAPI(platform, handle) {
 
     return {
       followers,
+      following,
+      likes: avgLikes,
+      videos: mediaCount,
       engagementRate,
       niche: user.category ?? null,
       location: user.city_name ?? null,
