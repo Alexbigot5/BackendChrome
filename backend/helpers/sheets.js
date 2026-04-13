@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+const forge = require('node-forge');
 
 const SHEET_HEADERS = [
   'Handle',
@@ -12,54 +12,29 @@ const SHEET_HEADERS = [
 ];
 
 /**
- * Parses the private key from the env var, handling all common formatting
- * issues (missing newlines, PKCS#1 vs PKCS#8, etc.).
- * Returns a Node.js KeyObject.
- */
-function parsePrivateKey() {
-  const raw = process.env.GOOGLE_PRIVATE_KEY || '';
-  if (!raw) throw new Error('GOOGLE_PRIVATE_KEY env var is missing');
-
-  // Normalize escaped newlines that may come from Railway/Heroku env vars
-  let keyStr = raw
-    .replace(/\\r\\n/g, '\n')
-    .replace(/\\r/g, '\n')
-    .replace(/\\n/g, '\n')
-    .replace(/\\n/g, '\n')
-    .trim();
-
-  // Detect key type from PEM header
-  const isPkcs1 = keyStr.includes('RSA PRIVATE KEY');
-  const label = isPkcs1 ? 'RSA PRIVATE KEY' : 'PRIVATE KEY';
-
-  // Strip existing PEM wrapping and reconstruct with exactly 64-char lines
-  // This fixes any whitespace / line-length issues that confuse OpenSSL 3
-  const base64 = keyStr.replace(/-----[A-Z ]+-----/g, '').replace(/[\s]+/g, '');
-  if (!base64) throw new Error('GOOGLE_PRIVATE_KEY is empty after stripping PEM headers');
-
-  const lines = base64.match(/.{1,64}/g) || [];
-  const pem = '-----BEGIN ' + label + '-----\n' + lines.join('\n') + '\n-----END ' + label + '-----\n';
-
-  try {
-    return crypto.createPrivateKey(pem);
-  } catch (err) {
-    throw new Error('Failed to parse private key (header: "' + label + '"): ' + err.message);
-  }
-}
-
-/**
- * Creates a short-lived Google OAuth2 access token using a service account
- * JWT, signed with Node.js built-in crypto (OpenSSL 3 compatible).
+ * Creates a short-lived Google OAuth2 access token using a service account JWT.
+ * Uses node-forge (pure JS) for RSA signing — avoids OpenSSL 3 compatibility issues.
  */
 async function getAccessToken() {
+  const raw = process.env.GOOGLE_PRIVATE_KEY || '';
   const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  if (!raw) throw new Error('GOOGLE_PRIVATE_KEY env var is missing');
   if (!serviceAccountEmail) throw new Error('GOOGLE_SERVICE_ACCOUNT_EMAIL env var is missing');
 
-  const privateKey = parsePrivateKey();
+  // Normalize escaped newlines that may come from Railway env vars
+  const keyPem = raw.replace(/\\n/g, '\n').trim();
+
+  // Parse private key using node-forge (pure JavaScript, no OpenSSL dependency)
+  let privateKey;
+  try {
+    privateKey = forge.pki.privateKeyFromPem(keyPem);
+  } catch (err) {
+    throw new Error('node-forge failed to parse private key: ' + err.message);
+  }
 
   const now = Math.floor(Date.now() / 1000);
-  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({
+  const headerB64 = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+  const payloadB64 = Buffer.from(JSON.stringify({
     iss: serviceAccountEmail,
     scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive',
     aud: 'https://oauth2.googleapis.com/token',
@@ -67,9 +42,14 @@ async function getAccessToken() {
     iat: now,
   })).toString('base64url');
 
-  const toSign = header + '.' + payload;
-  const signature = crypto.sign('SHA256', Buffer.from(toSign), privateKey).toString('base64url');
-  const jwt = toSign + '.' + signature;
+  const toSign = headerB64 + '.' + payloadB64;
+
+  // Sign using node-forge RSA-SHA256
+  const md = forge.md.sha256.create();
+  md.update(toSign, 'utf8');
+  const signatureBytes = privateKey.sign(md);
+  const signatureB64 = Buffer.from(signatureBytes, 'binary').toString('base64url');
+  const jwt = toSign + '.' + signatureB64;
 
   const resp = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
