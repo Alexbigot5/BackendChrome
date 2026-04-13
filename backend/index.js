@@ -7,6 +7,7 @@ const webhookRouter = require('./routes/webhook');
 const verifyRouter = require('./routes/verify');
 const saveRouter = require('./routes/save');
 const onboardingRouter = require('./routes/onboarding');
+const provisionRouter = require('./routes/provision');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,7 +38,7 @@ app.use(express.json());
 app.use('/verify', verifyRouter);
 app.use('/save', saveRouter);
 app.use('/onboarding', onboardingRouter);
-
+app.use('/provision', provisionRouter);
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ─── Centralised error handler ──────────────────────────────────────────────
@@ -48,4 +49,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`LiveChrome backend listening on port ${PORT}`);
-});
+});app.use('/provision', provisionRouter);
+app.use('/provision', provisionRouter);
