@@ -65,7 +65,7 @@ router.post('/', async (req, res) => {
     );
 
     const savesThisMonth = parseInt(usageResult.rows[0].saves_this_month, 10);
-    const planLimit = user.stripe_subscription_id ? 2000 : 20;
+    const planLimit = user.stripe_subscription_id ? 2000 : 200;
     // TODO: differentiate Starter ($10/2000) vs Pro ($29/unlimited)
 
     if (savesThisMonth >= planLimit) {
