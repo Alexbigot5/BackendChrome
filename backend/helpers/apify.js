@@ -138,6 +138,8 @@ async function runApify(platform, handle) {
     throw new Error('Apify returned no data for this handle');
   }
 
+  console.log('[APIFY] Raw item:', JSON.stringify(items[0]));
+
   return normaliseResult(platform, items[0]);
 }
 
