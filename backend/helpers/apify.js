@@ -32,9 +32,9 @@ function normaliseResult(platform, item) {
   if (platform === 'tiktok') {
     const meta = item.authorMeta ?? item;
     const followerCount = meta.fans ?? meta.followerCount ?? null;
-    const followingCount = item.following ?? item.stats?.followingCount ?? null;
-    const heartCount = item.heart ?? item.heartCount ?? item.stats?.heartCount ?? null;
-    const videoCount = item.video ?? item.videoCount ?? item.stats?.videoCount ?? null;
+    const followingCount = meta.following ?? null;
+    const heartCount = meta.heart ?? meta.heartCount ?? null;
+    const videoCount = meta.video ?? meta.videoCount ?? null;
 
     let engagementRate = null;
     if (followerCount && heartCount && videoCount && videoCount > 0) {
