@@ -30,7 +30,8 @@ function buildInput(platform, handle) {
 
 function normaliseResult(platform, item) {
   if (platform === 'tiktok') {
-    const followerCount = item.fans ?? item.followerCount ?? item.stats?.followerCount ?? null;
+    const meta = item.authorMeta ?? item;
+    const followerCount = meta.fans ?? meta.followerCount ?? null;
     const followingCount = item.following ?? item.stats?.followingCount ?? null;
     const heartCount = item.heart ?? item.heartCount ?? item.stats?.heartCount ?? null;
     const videoCount = item.video ?? item.videoCount ?? item.stats?.videoCount ?? null;
