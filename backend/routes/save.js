@@ -66,7 +66,6 @@ router.post('/', async (req, res) => {
 
     const savesThisMonth = parseInt(usageResult.rows[0].saves_this_month, 10);
     const planLimit = user.stripe_subscription_id ? 2000 : 200;
-    // TODO: differentiate Starter ($10/2000) vs Pro ($29/unlimited)
 
     if (savesThisMonth >= planLimit) {
       return res.status(429).json({
@@ -79,21 +78,23 @@ router.post('/', async (req, res) => {
     console.error('[SAVE] Usage check error:', err.message);
   }
 
-  // ─── Fetch user's campaign brief preferences ─────────────────────────────
+  // ─── Fetch user preferences (brief + fields) ──────────────────────────────
   let brief = null;
+  let userFields = null;
   try {
     const prefResult = await pool.query(
       'SELECT * FROM user_preferences WHERE user_id = $1',
       [user.id]
     );
     if (prefResult.rows.length > 0) {
-      brief = prefResult.rows[0];
+      brief      = prefResult.rows[0];
+      userFields = prefResult.rows[0].fields; // TEXT[] of field keys
     }
   } catch (err) {
-    console.error('[SAVE] Failed to load brief preferences:', err.message);
+    console.error('[SAVE] Failed to load preferences:', err.message);
   }
 
-  // ─── Run Apify scraper ────────────────────────────────────────────────────
+  // ─── Run scraper ──────────────────────────────────────────────────────────
   let scrapedData;
   try {
     scrapedData = await scrapeCreator(platform, handle);
@@ -110,15 +111,15 @@ router.post('/', async (req, res) => {
     console.log(`[SCORE] @${handle} scored ${matchScore}% against ${user.email}'s brief`);
   }
 
-  // ─── Write results to Google Sheet ────────────────────────────────────────
+  // ─── Write to Google Sheet (using user's chosen column layout) ────────────
   try {
-    await appendToSheet(user.sheet_id, handle, platform, scrapedData);
+    await appendToSheet(user.sheet_id, handle, platform, scrapedData, userFields);
   } catch (err) {
     console.error(`[SAVE] Sheets write error for user ${user.email}:`, err.message);
     return res.status(502).json({ error: 'Failed to write to Google Sheet' });
   }
 
-  // ─── Log the save to scrape_log ───────────────────────────────────────────
+  // ─── Log to scrape_log ────────────────────────────────────────────────────
   try {
     await pool.query(
       'INSERT INTO scrape_log (user_id, handle, platform) VALUES ($1, $2, $3)',
