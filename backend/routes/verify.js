@@ -4,15 +4,16 @@ const router = express.Router();
 const { pool } = require('../db');
 const { rateLimit } = require('../middleware/rateLimit');
 
-// ─── Rate limit: 20 verify requests per minute per IP ──────────────────────
 router.use(rateLimit({ windowMs: 60_000, max: 20 }));
 
 /**
  * POST /verify
  * Body: { googleToken }
  *
- * Validates the Google OAuth token, extracts the email, and returns
- * the user's LiveChrome token + sheet ID if they have an active sub.
+ * 1. Resolves the Google email from the Chrome identity token
+ * 2. Looks up user by google_email OR email (handles same-email Clerk signups)
+ * 3. If found via email match but google_email not yet stored, saves it for future lookups
+ * 4. Never creates users — only /provision (Clerk flow) does that
  */
 router.post('/', async (req, res) => {
   const { googleToken } = req.body;
@@ -21,15 +22,14 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'googleToken is required' });
   }
 
-  let email;
+  let googleEmail;
   try {
     const googleRes = await axios.get(
       'https://www.googleapis.com/oauth2/v1/userinfo?alt=json',
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
-    email = googleRes.data.email;
-
-    if (!email) {
+    googleEmail = googleRes.data.email?.toLowerCase().trim();
+    if (!googleEmail) {
       return res.status(401).json({ error: 'Could not resolve email from Google token' });
     }
   } catch (err) {
@@ -38,16 +38,39 @@ router.post('/', async (req, res) => {
   }
 
   try {
+    // Match on google_email (returning users) OR email (first-time extension login
+    // where Clerk signup email === Google account email)
     const result = await pool.query(
-      'SELECT active, token, sheet_id FROM users WHERE email = $1',
-      [email.toLowerCase().trim()]
+      `SELECT id, active, token, sheet_id, google_email
+       FROM users
+       WHERE (google_email = $1 OR email = $1)
+       LIMIT 1`,
+      [googleEmail]
     );
 
-    if (result.rows.length === 0 || !result.rows[0].active) {
+    if (result.rows.length === 0) {
+      console.log(`[VERIFY] No account found for Google email: ${googleEmail}`);
       return res.json({ valid: false });
     }
 
     const user = result.rows[0];
+
+    if (!user.active) {
+      return res.json({ valid: false });
+    }
+
+    if (!user.sheet_id) {
+      return res.json({ valid: false });
+    }
+
+    // First time signing in via extension — store google_email for future lookups
+    if (!user.google_email) {
+      pool.query('UPDATE users SET google_email = $1 WHERE id = $2', [googleEmail, user.id])
+        .catch(err => console.error('[VERIFY] Failed to save google_email:', err.message));
+    }
+
+    console.log(`[VERIFY] Verified ${googleEmail} → user ${user.id}, sheet ${user.sheet_id}`);
+
     return res.json({
       valid: true,
       token: user.token,
@@ -55,38 +78,7 @@ router.post('/', async (req, res) => {
     });
   } catch (err) {
     console.error('[VERIFY] DB error:', err.message);
-    res.status(500).json({ error: 'Failed to verify user' });
-  }
-});
-
-// Backwards-compatible GET (deprecated — remove once extension is updated)
-router.get('/', async (req, res) => {
-  console.warn('[VERIFY] Deprecated GET /verify called — migrate to POST with googleToken');
-  const { email } = req.query;
-
-  if (!email) {
-    return res.status(400).json({ error: 'email query parameter is required' });
-  }
-
-  try {
-    const result = await pool.query(
-      'SELECT active, token, sheet_id FROM users WHERE email = $1',
-      [email.toLowerCase().trim()]
-    );
-
-    if (result.rows.length === 0 || !result.rows[0].active) {
-      return res.json({ valid: false });
-    }
-
-    const user = result.rows[0];
-    return res.json({
-      valid: true,
-      token: user.token,
-      sheetId: user.sheet_id,
-    });
-  } catch (err) {
-    console.error('[VERIFY] DB error:', err.message);
-    res.status(500).json({ error: 'Failed to verify user' });
+    return res.status(500).json({ error: 'Failed to verify user' });
   }
 });
 
