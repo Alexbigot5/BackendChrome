@@ -13,20 +13,8 @@ const statsRouter      = require('./routes/stats');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({
-  origin(origin, callback) {
-    // No origin = server-to-server or curl — allow
-    if (!origin) return callback(null, true);
-    // Chrome extensions
-    if (origin.startsWith('chrome-extension://')) return callback(null, true);
-    // Frontend URL
-    if (process.env.FRONTEND_URL && origin === process.env.FRONTEND_URL) return callback(null, true);
-    // Vercel preview URLs
-    if (origin.endsWith('.vercel.app')) return callback(null, true);
-    callback(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-}));
+// Allow ALL origins — we handle auth via tokens, CORS is not a security boundary here
+app.use(cors({ origin: true, credentials: true }));
 
 app.use('/webhook', express.raw({ type: 'application/json' }), webhookRouter);
 app.use(express.json());
