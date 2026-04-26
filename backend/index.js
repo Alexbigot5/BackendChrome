@@ -9,6 +9,7 @@ const saveRouter       = require('./routes/save');
 const onboardingRouter = require('./routes/onboarding');
 const provisionRouter  = require('./routes/provision');
 const statsRouter      = require('./routes/stats');
+const brandRouter      = require('./routes/brand');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -24,6 +25,7 @@ app.use('/save',       saveRouter);
 app.use('/onboarding', onboardingRouter);
 app.use('/provision',  provisionRouter);
 app.use('/stats',      statsRouter);
+app.use('/brand',      brandRouter);
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 app.use((err, _req, res, _next) => {
