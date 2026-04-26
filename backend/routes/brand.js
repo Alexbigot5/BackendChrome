@@ -249,52 +249,78 @@ router.post('/', authenticate, async (req, res) => {
   // ── Section 2: Creator Partnership History ──────────────────────────────────
   let partnerships = null;
   {
-    // Combine TikTok hashtag results (both #brand and #brandpartner)
+    // ScrapeCreators hashtag search can return different keys depending on endpoint version
+    const extractTTVideos = (d) =>
+      d?.videos || d?.item_list || d?.aweme_list || d?.data || d?.items || [];
+
     const ttVideos = [
-      ...(ttHashtag?.videos     || ttHashtag?.data     || []),
-      ...(ttHashtagPartner?.videos || ttHashtagPartner?.data || []),
+      ...extractTTVideos(ttHashtag),
+      ...extractTTVideos(ttHashtagPartner),
     ];
+
+    // Log what we got so we can debug field shapes
+    if (ttVideos.length > 0) {
+      const sample = ttVideos[0];
+      console.log(`[BRAND] TikTok video sample keys: ${Object.keys(sample).slice(0,10).join(', ')}`);
+      if (sample.author) console.log(`[BRAND] author keys: ${Object.keys(sample.author).join(', ')}`);
+      console.log(`[BRAND] createTime=${sample.createTime}, create_time=${sample.create_time}`);
+    }
 
     // Deduplicate by video ID
     const seen    = new Set();
     const ttPosts = ttVideos
-      .filter(v => { const id = v.id || v.video_id || v.aweme_id; if (seen.has(id)) return false; seen.add(id); return true; })
+      .filter(v => {
+        const id = v.id || v.video_id || v.aweme_id || v.itemId;
+        if (!id || seen.has(String(id))) return false;
+        seen.add(String(id));
+        return true;
+      })
       .map(v => {
-        const author  = v.author || v.music?.author || {};
-        const stats   = v.stats  || v.statistics || {};
-        const caption = v.desc   || v.description || v.title || '';
+        const author  = v.author || v.authorInfo || v.authorMeta || {};
+        const stats   = v.stats  || v.statistics || v.statsV2 || {};
+        const caption = v.desc   || v.description || v.text || v.title || '';
+        // Handle timestamps as either seconds or milliseconds, and as string or number
+        const rawTs   = v.createTime || v.create_time || v.createTimestamp || v.timestamp || null;
+        const unixTs  = rawTs ? (Number(rawTs) > 1e12 ? Math.floor(Number(rawTs) / 1000) : Number(rawTs)) : null;
+        const handle  = author.uniqueId || author.unique_id || author.nickname || author.name;
         return {
           platform:   'tiktok',
-          creator:    author.uniqueId || author.nickname || 'unknown',
-          followers:  author.followerCount || null,
+          creator:    handle || 'unknown',
+          followers:  author.followerCount || author.fans || null,
           caption:    caption.slice(0, 200),
-          likes:      stats.diggCount    || stats.like_count    || 0,
-          views:      stats.playCount    || stats.play_count    || 0,
-          comments:   stats.commentCount || stats.comment_count || 0,
-          date:       ts(v.createTime   || v.create_time),
-          daysAgo:    daysAgo(v.createTime || v.create_time),
-          url:        v.video?.playAddr ? `https://www.tiktok.com/@${author.uniqueId}/video/${v.id || v.aweme_id}` : null,
+          likes:      Number(stats.diggCount    || stats.like_count    || stats.likeCount    || 0),
+          views:      Number(stats.playCount    || stats.play_count    || stats.viewCount    || 0),
+          comments:   Number(stats.commentCount || stats.comment_count || stats.replyCount   || 0),
+          date:       ts(unixTs),
+          daysAgo:    daysAgo(unixTs),
+          url:        handle ? `https://www.tiktok.com/@${handle}/video/${v.id || v.aweme_id}` : null,
           isSponsored: isSponsoredCaption(caption),
         };
       })
       .filter(p => p.creator !== 'unknown');
 
     // Instagram reels search results
-    const igPosts = (igReelsSearch?.reels || igReelsSearch?.results || [])
+    const igPosts = (igReelsSearch?.reels || igReelsSearch?.results || igReelsSearch?.data || [])
       .slice(0, 15)
       .map(r => {
         const caption = r.caption || r.description || r.title || '';
+        // IG timestamps can be unix seconds, ms, or ISO string
+        const rawTs   = r.taken_at || r.timestamp || r.created_at || null;
+        const unixTs  = rawTs
+          ? (typeof rawTs === 'string' ? Math.floor(new Date(rawTs).getTime() / 1000)
+            : Number(rawTs) > 1e12 ? Math.floor(Number(rawTs) / 1000) : Number(rawTs))
+          : null;
         return {
           platform:   'instagram',
-          creator:    r.username || r.owner?.username || 'unknown',
-          followers:  null, // not returned by search endpoint
+          creator:    r.username || r.owner?.username || r.user?.username || 'unknown',
+          followers:  null,
           caption:    caption.slice(0, 200),
-          likes:      r.like_count       || r.likeCount       || 0,
-          views:      r.play_count       || r.playCount       || r.view_count || 0,
-          comments:   r.comment_count    || r.commentCount    || 0,
-          date:       ts(r.taken_at      || r.timestamp),
-          daysAgo:    daysAgo(r.taken_at || r.timestamp),
-          url:        r.permalink        || r.url || null,
+          likes:      Number(r.like_count    || r.likeCount    || 0),
+          views:      Number(r.play_count    || r.playCount    || r.view_count || 0),
+          comments:   Number(r.comment_count || r.commentCount || 0),
+          date:       ts(unixTs),
+          daysAgo:    daysAgo(unixTs),
+          url:        r.permalink || r.url || null,
           isSponsored: isSponsoredCaption(caption),
         };
       })
