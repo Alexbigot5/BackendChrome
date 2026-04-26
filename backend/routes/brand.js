@@ -1,286 +1,401 @@
 const express = require('express');
-const router = express.Router();
-const axios = require('axios');
+const router  = express.Router();
+const axios   = require('axios');
 const { rateLimit } = require('../middleware/rateLimit');
 
-const SC_BASE = 'https://api.scrapecreators.com';
+const SC = 'https://api.scrapecreators.com';
 
-// Rate limit: 10 brand lookups per minute per user
 router.use(rateLimit({ windowMs: 60_000, max: 10, keyFn: (req) => req.ip }));
 
-/**
- * POST /brand
- * Body: { url }  — any brand URL or handle
- * Auth: Authorization: Bearer <clerk-session-token>  OR  x-livechrome-token: <internal-token>
- *
- * Calls ScrapeCreators Facebook Ad Library:
- *   1. GET /v1/facebook/adLibrary/search/companies?query=<handle>  → find pageId
- *   2. GET /v1/facebook/adLibrary/company/ads?pageId=<id>&status=ACTIVE  → get ads
- *
- * Real response shape (from docs):
- * {
- *   results: [ {
- *     ad_archive_id, is_active, page_name, page_id,
- *     publisher_platform: ['INSTAGRAM', 'FACEBOOK'],   ← top-level array
- *     start_date: 1740643200,                          ← unix timestamp
- *     snapshot: {
- *       display_format: 'VIDEO',
- *       body: { text: '...' },
- *       title: null,
- *       cta_text: 'Learn more',
- *       images: [],
- *       videos: [{ video_preview_image_url: '...' }],
- *       cards: [],
- *     }
- *   } ],
- *   cursor: '...'
- * }
- */
-router.post('/', async (req, res) => {
-  // Accept Clerk Bearer token (dashboard) or internal token (extension)
+// ─── Auth middleware ──────────────────────────────────────────────────────────
+async function authenticate(req, res, next) {
   const authHeader    = req.headers.authorization;
   const internalToken = req.headers['x-livechrome-token'];
 
   if (!authHeader && !internalToken) {
-    return res.status(401).json({ error: 'Missing Authorization header or x-livechrome-token' });
+    return res.status(401).json({ error: 'Missing auth' });
   }
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const sessionToken = authHeader.slice(7);
     try {
-      const payloadB64 = sessionToken.split('.')[1];
-      const payload    = JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
-      const clerkUserId = payload.sub;
-      const sessionId   = payload.sid;
-      if (!clerkUserId || !sessionId) throw new Error('Malformed token');
+      const sessionToken = authHeader.slice(7);
+      const payload      = JSON.parse(Buffer.from(sessionToken.split('.')[1], 'base64url').toString());
+      if (!payload.sub || !payload.sid) throw new Error('Malformed token');
 
-      const sessionResp = await fetch('https://api.clerk.com/v1/sessions/' + sessionId, {
-        headers: { Authorization: 'Bearer ' + process.env.CLERK_SECRET_KEY },
+      const r = await fetch(`https://api.clerk.com/v1/sessions/${payload.sid}`, {
+        headers: { Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}` },
       });
-      if (!sessionResp.ok) throw new Error('Session not found');
-      const session = await sessionResp.json();
-      if (session.status !== 'active') throw new Error('Session not active');
+      if (!r.ok) throw new Error('Session not found');
+      const session = await r.json();
+      if (session.status !== 'active') throw new Error('Session inactive');
     } catch (err) {
       return res.status(401).json({ error: 'Auth failed: ' + err.message });
     }
-  } else if (internalToken) {
+  } else {
     const { pool } = require('../db');
-    try {
-      const result = await pool.query(
-        'SELECT id FROM users WHERE token = $1 AND active = true',
-        [internalToken]
-      );
-      if (result.rows.length === 0) {
-        return res.status(401).json({ error: 'Invalid or inactive token' });
-      }
-    } catch (err) {
-      return res.status(500).json({ error: 'Auth check failed' });
-    }
+    const result = await pool.query(
+      'SELECT id FROM users WHERE token=$1 AND active=true', [internalToken]
+    ).catch(() => ({ rows: [] }));
+    if (!result.rows.length) return res.status(401).json({ error: 'Invalid token' });
   }
 
-  const { url } = req.body;
-  if (!url || !url.trim()) {
-    return res.status(400).json({ error: 'url is required' });
-  }
+  next();
+}
 
-  const apiKey = process.env.SCRAPECREATORS_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'SCRAPECREATORS_API_KEY env var is missing' });
-  }
-
-  const handle = extractHandle(url.trim());
-  console.log(`[BRAND] Researching: "${handle}" (input: "${url}")`);
-
+// ─── Safe fetch — never throws, returns null on failure ──────────────────────
+async function safeFetch(label, fn) {
   try {
-    // ── Step 1: Find the Facebook page ID ──────────────────────────────────
-    let pageId   = null;
-    let pageName = null;
-
-    try {
-      const companyRes = await axios.get(`${SC_BASE}/v1/facebook/adLibrary/search/companies`, {
-        params:  { query: handle },
-        headers: { 'x-api-key': apiKey },
-        timeout: 15000,
-      });
-
-      // Response: { searchResults: [{ page_id, page_name, ... }] }
-      const results = companyRes.data?.searchResults || [];
-      if (results.length > 0) {
-        const exact = results.find(r =>
-          (r.page_name || '').toLowerCase() === handle.toLowerCase()
-        );
-        const best = exact || results[0];
-        pageId   = best.page_id   || null;
-        pageName = best.page_name || null;
-      }
-      console.log(`[BRAND] Company lookup: pageId=${pageId}, pageName=${pageName}`);
-    } catch (err) {
-      console.warn(`[BRAND] Company lookup failed:`, err.message);
-    }
-
-    // ── Step 2: Fetch active ads ────────────────────────────────────────────
-    let rawAds = [];
-    try {
-      // Build params — prefer pageId (more precise), fall back to companyName
-      const params = {
-        status:   'ACTIVE',
-        country:  'ALL',
-        trim:     'false',   // full response so we get snapshot details
-      };
-      if (pageId) {
-        params.pageId = pageId;
-      } else {
-        params.companyName = handle;
-      }
-
-      const adsRes = await axios.get(`${SC_BASE}/v1/facebook/adLibrary/company/ads`, {
-        params,
-        headers: { 'x-api-key': apiKey },
-        timeout: 20000,
-      });
-
-      // Real response key is "results" (not "ads" or "searchResults")
-      rawAds = adsRes.data?.results || [];
-      console.log(`[BRAND] Raw ads fetched: ${rawAds.length}`);
-
-      // Debug: log the first ad structure so we can see what fields come back
-      if (rawAds.length > 0) {
-        const sample = rawAds[0];
-        console.log(`[BRAND] Sample ad keys: ${Object.keys(sample).join(', ')}`);
-        console.log(`[BRAND] publisher_platform: ${JSON.stringify(sample.publisher_platform)}`);
-        console.log(`[BRAND] snapshot.display_format: ${sample.snapshot?.display_format}`);
-      }
-    } catch (err) {
-      console.warn(`[BRAND] Ads fetch failed:`, err.message);
-      if (err.response) {
-        console.warn(`[BRAND] Response status: ${err.response.status}`);
-        console.warn(`[BRAND] Response data: ${JSON.stringify(err.response.data)}`);
-      }
-    }
-
-    // ── Normalise ads ───────────────────────────────────────────────────────
-    const ads = rawAds.slice(0, 20).map(ad => {
-      const snap = ad.snapshot || {};
-
-      // Body text
-      const body = snap.body?.text || snap.caption || snap.title || null;
-
-      // Thumbnail — videos have preview images, images have direct URLs
-      const imageUrl =
-        snap.videos?.[0]?.video_preview_image_url ||
-        snap.images?.[0]?.resized_image_url        ||
-        snap.images?.[0]?.original_image_url        ||
-        snap.cards?.[0]?.resized_image_url          ||
-        null;
-
-      // publisher_platform is top-level on the ad object (array of strings like 'INSTAGRAM')
-      const publisherPlatforms = (ad.publisher_platform || [])
-        .map(p => (typeof p === 'string' ? p : (p.name || '')))
-        .filter(Boolean);
-
-      const format = detectFormat(snap);
-
-      return {
-        id:        ad.ad_archive_id || String(Math.random()),
-        title:     snap.title || snap.link_description || ad.page_name || pageName || handle,
-        body:      body ? body.slice(0, 160) : null,
-        platform:  publisherPlatforms[0] || 'FACEBOOK',
-        platforms: publisherPlatforms,
-        format,
-        startDate: formatTimestamp(ad.start_date),
-        status:    ad.is_active ? 'ACTIVE' : 'INACTIVE',
-        ctaText:   snap.cta_text || null,
-        imageUrl,
-      };
-    });
-
-    // ── Aggregate stats ─────────────────────────────────────────────────────
-    const platformCounts = countBy(ads, a => normalisePlatform(a.platform));
-    const formatCounts   = countBy(ads, a => a.format);
-
-    const platforms = Object.entries(platformCounts)
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count);
-
-    const formats = Object.entries(formatCounts)
-      .map(([label, count]) => ({ label, count }))
-      .sort((a, b) => b.count - a.count);
-
-    console.log(`[BRAND] Done: ${ads.length} ads, platforms: ${platforms.map(p => p.name).join(', ')}, formats: ${formats.map(f => f.label).join(', ')}`);
-
-    return res.json({
-      handle,
-      pageId,
-      pageName:  pageName || handle,
-      totalAds:  rawAds.length,
-      activeAds: ads.length,
-      platforms,
-      formats,
-      ads,
-    });
-
+    const result = await fn();
+    console.log(`[BRAND] ✓ ${label}`);
+    return result;
   } catch (err) {
-    console.error(`[BRAND] Unexpected error:`, err.message);
-    return res.status(502).json({ error: `Brand research failed: ${err.message}` });
+    const status = err.response?.status;
+    const msg    = err.response?.data?.message || err.message;
+    console.warn(`[BRAND] ✗ ${label}: ${status ? `HTTP ${status} — ` : ''}${msg}`);
+    return null;
   }
-});
+}
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractHandle(input) {
   try {
     if (input.startsWith('http://') || input.startsWith('https://')) {
-      const u        = new URL(input);
-      const segments = u.pathname.split('/').filter(Boolean);
-      const last     = segments[segments.length - 1] || '';
-      return last.replace(/^@/, '') || u.hostname.replace('www.', '');
+      const u   = new URL(input);
+      const seg = u.pathname.split('/').filter(Boolean);
+      return (seg[seg.length - 1] || '').replace(/^@/, '') || u.hostname.replace('www.', '');
     }
   } catch (_) {}
   return input.replace(/^@/, '');
 }
 
-function detectFormat(snap) {
-  const df = (snap.display_format || '').toUpperCase();
-  if (df.includes('VIDEO'))                              return 'Video';
-  if (df.includes('REEL'))                               return 'Reel';
-  if (df.includes('STORY'))                              return 'Story';
-  if (df.includes('CAROUSEL') || df.includes('MULTI'))  return 'Carousel';
-  if (df.includes('IMAGE'))                              return 'Image';
-  // Fall back to media presence
-  if (snap.videos?.length)                               return 'Video';
-  if ((snap.cards?.length || 0) > 1)                    return 'Carousel';
-  if (snap.images?.length)                               return 'Image';
+function ts(unix) {
+  if (!unix) return null;
+  return new Date(unix * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function daysAgo(unix) {
+  if (!unix) return null;
+  return Math.floor((Date.now() - unix * 1000) / 86400000);
+}
+
+function detectMetaFormat(snap) {
+  const df = (snap?.display_format || '').toUpperCase();
+  if (df.includes('VIDEO'))   return 'Video';
+  if (df.includes('REEL'))    return 'Reel';
+  if (df.includes('STORY'))   return 'Story';
+  if (df.includes('CAROUSEL') || df.includes('MULTI')) return 'Carousel';
+  if (df.includes('IMAGE'))   return 'Image';
+  if (snap?.videos?.length)   return 'Video';
+  if ((snap?.cards?.length || 0) > 1) return 'Carousel';
+  if (snap?.images?.length)   return 'Image';
   return 'Image';
 }
 
-function normalisePlatform(p) {
+function normPlatform(p) {
   const s = (p || '').toLowerCase();
-  if (s.includes('instagram'))  return 'Instagram';
-  if (s.includes('facebook'))   return 'Facebook';
-  if (s.includes('tiktok'))     return 'TikTok';
-  if (s.includes('messenger'))  return 'Messenger';
-  if (s.includes('whatsapp'))   return 'WhatsApp';
-  if (s.includes('audience'))   return 'Audience Network';
+  if (s.includes('instagram')) return 'Instagram';
+  if (s.includes('facebook'))  return 'Facebook';
+  if (s.includes('messenger')) return 'Messenger';
+  if (s.includes('whatsapp'))  return 'WhatsApp';
+  if (s.includes('audience'))  return 'Audience Network';
   return 'Facebook';
 }
 
-function countBy(arr, keyFn) {
-  return arr.reduce((acc, item) => {
-    const k = keyFn(item);
-    acc[k] = (acc[k] || 0) + 1;
-    return acc;
-  }, {});
+function countBy(arr, fn) {
+  return arr.reduce((acc, x) => { const k = fn(x); acc[k] = (acc[k] || 0) + 1; return acc; }, {});
 }
 
-function formatTimestamp(ts) {
-  if (!ts) return null;
-  try {
-    return new Date(ts * 1000).toLocaleDateString('en-US', {
-      month: 'short', day: 'numeric', year: 'numeric',
-    });
-  } catch (_) {
-    return null;
-  }
+const SPONSORED_TAGS = ['#ad', '#sponsored', '#partner', '#gifted', '#collab', '#paidpartnership', '#brandambassador'];
+
+function isSponsoredCaption(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return SPONSORED_TAGS.some(t => lower.includes(t));
 }
+
+// ─── POST /brand ──────────────────────────────────────────────────────────────
+router.post('/', authenticate, async (req, res) => {
+  const { url } = req.body;
+  if (!url?.trim()) return res.status(400).json({ error: 'url is required' });
+
+  const apiKey = process.env.SCRAPECREATORS_API_KEY;
+  if (!apiKey)  return res.status(500).json({ error: 'SCRAPECREATORS_API_KEY missing' });
+
+  const handle = extractHandle(url.trim());
+  console.log(`[BRAND] Starting research for "${handle}"`);
+
+  // ── Run all lookups in parallel ─────────────────────────────────────────────
+  const [
+    metaCompany,
+    igProfile,
+    ttProfile,
+    ttHashtag,
+    ttHashtagPartner,
+    igReelsSearch,
+    googleAds,
+  ] = await Promise.all([
+
+    // 1a. Meta: find page ID
+    safeFetch('Meta company search', () =>
+      axios.get(`${SC}/v1/facebook/adLibrary/search/companies`, {
+        params: { query: handle }, headers: { 'x-api-key': apiKey }, timeout: 12000,
+      }).then(r => r.data)
+    ),
+
+    // 2. Instagram profile
+    safeFetch('Instagram profile', () =>
+      axios.get(`${SC}/v1/instagram/profile`, {
+        params: { handle }, headers: { 'x-api-key': apiKey }, timeout: 12000,
+      }).then(r => r.data)
+    ),
+
+    // 3. TikTok profile
+    safeFetch('TikTok profile', () =>
+      axios.get(`${SC}/v1/tiktok/profile`, {
+        params: { handle }, headers: { 'x-api-key': apiKey }, timeout: 12000,
+      }).then(r => r.data)
+    ),
+
+    // 4a. TikTok hashtag: #brandname
+    safeFetch('TikTok hashtag search', () =>
+      axios.get(`${SC}/v1/tiktok/search/hashtag`, {
+        params: { hashtag: handle }, headers: { 'x-api-key': apiKey }, timeout: 15000,
+      }).then(r => r.data)
+    ),
+
+    // 4b. TikTok hashtag: #brandnamepartner
+    safeFetch('TikTok partner hashtag', () =>
+      axios.get(`${SC}/v1/tiktok/search/hashtag`, {
+        params: { hashtag: `${handle}partner` }, headers: { 'x-api-key': apiKey }, timeout: 15000,
+      }).then(r => r.data)
+    ),
+
+    // 4c. Instagram reels search: "brandname sponsored"
+    safeFetch('Instagram reels search', () =>
+      axios.get(`${SC}/v2/instagram/reels/search`, {
+        params: { query: `${handle} sponsored` }, headers: { 'x-api-key': apiKey }, timeout: 15000,
+      }).then(r => r.data)
+    ),
+
+    // 5. Google Ads
+    safeFetch('Google ads', () =>
+      axios.get(`${SC}/v1/google/company/ads`, {
+        params: { companyName: handle, get_ad_details: 'true' },
+        headers: { 'x-api-key': apiKey }, timeout: 15000,
+      }).then(r => r.data)
+    ),
+  ]);
+
+  // ── Section 1: Meta Ads ─────────────────────────────────────────────────────
+  let metaAds = null;
+  {
+    // Find the best matching page ID
+    const companies  = metaCompany?.searchResults || [];
+    const exact      = companies.find(c => (c.page_name || '').toLowerCase() === handle.toLowerCase());
+    const best       = exact || companies[0];
+    const pageId     = best?.page_id   || null;
+    const pageName   = best?.page_name || null;
+
+    // Fetch ads using pageId if we found one
+    let rawAds = [];
+    if (pageId || handle) {
+      const adsData = await safeFetch('Meta company ads', () =>
+        axios.get(`${SC}/v1/facebook/adLibrary/company/ads`, {
+          params: {
+            ...(pageId ? { pageId } : { companyName: handle }),
+            status:  'ACTIVE',
+            country: 'ALL',
+            trim:    'false',
+          },
+          headers: { 'x-api-key': apiKey },
+          timeout: 20000,
+        }).then(r => r.data)
+      );
+      rawAds = adsData?.results || [];
+    }
+
+    const ads = rawAds.slice(0, 20).map(ad => {
+      const snap = ad.snapshot || {};
+      return {
+        id:        ad.ad_archive_id || String(Math.random()),
+        title:     snap.title || snap.link_description || ad.page_name || pageName || handle,
+        body:      (snap.body?.text || snap.caption || '').slice(0, 160) || null,
+        platforms: (ad.publisher_platform || []).map(p => normPlatform(p)),
+        format:    detectMetaFormat(snap),
+        startDate: ts(ad.start_date),
+        daysRunning: daysAgo(ad.start_date),
+        ctaText:   snap.cta_text || null,
+        imageUrl:  snap.videos?.[0]?.video_preview_image_url
+                || snap.images?.[0]?.resized_image_url
+                || snap.images?.[0]?.original_image_url
+                || null,
+      };
+    });
+
+    const platformCounts = countBy(ads.flatMap(a => a.platforms), p => p);
+    const formatCounts   = countBy(ads, a => a.format);
+
+    metaAds = {
+      pageId,
+      pageName:  pageName || handle,
+      totalAds:  rawAds.length,
+      activeAds: ads.length,
+      platforms: Object.entries(platformCounts).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count),
+      formats:   Object.entries(formatCounts).map(([label, count]) => ({ label, count })).sort((a,b) => b.count - a.count),
+      ads,
+    };
+  }
+
+  // ── Section 2: Creator Partnership History ──────────────────────────────────
+  let partnerships = null;
+  {
+    // Combine TikTok hashtag results (both #brand and #brandpartner)
+    const ttVideos = [
+      ...(ttHashtag?.videos     || ttHashtag?.data     || []),
+      ...(ttHashtagPartner?.videos || ttHashtagPartner?.data || []),
+    ];
+
+    // Deduplicate by video ID
+    const seen    = new Set();
+    const ttPosts = ttVideos
+      .filter(v => { const id = v.id || v.video_id || v.aweme_id; if (seen.has(id)) return false; seen.add(id); return true; })
+      .map(v => {
+        const author  = v.author || v.music?.author || {};
+        const stats   = v.stats  || v.statistics || {};
+        const caption = v.desc   || v.description || v.title || '';
+        return {
+          platform:   'tiktok',
+          creator:    author.uniqueId || author.nickname || 'unknown',
+          followers:  author.followerCount || null,
+          caption:    caption.slice(0, 200),
+          likes:      stats.diggCount    || stats.like_count    || 0,
+          views:      stats.playCount    || stats.play_count    || 0,
+          comments:   stats.commentCount || stats.comment_count || 0,
+          date:       ts(v.createTime   || v.create_time),
+          daysAgo:    daysAgo(v.createTime || v.create_time),
+          url:        v.video?.playAddr ? `https://www.tiktok.com/@${author.uniqueId}/video/${v.id || v.aweme_id}` : null,
+          isSponsored: isSponsoredCaption(caption),
+        };
+      })
+      .filter(p => p.creator !== 'unknown');
+
+    // Instagram reels search results
+    const igPosts = (igReelsSearch?.reels || igReelsSearch?.results || [])
+      .slice(0, 15)
+      .map(r => {
+        const caption = r.caption || r.description || r.title || '';
+        return {
+          platform:   'instagram',
+          creator:    r.username || r.owner?.username || 'unknown',
+          followers:  null, // not returned by search endpoint
+          caption:    caption.slice(0, 200),
+          likes:      r.like_count       || r.likeCount       || 0,
+          views:      r.play_count       || r.playCount       || r.view_count || 0,
+          comments:   r.comment_count    || r.commentCount    || 0,
+          date:       ts(r.taken_at      || r.timestamp),
+          daysAgo:    daysAgo(r.taken_at || r.timestamp),
+          url:        r.permalink        || r.url || null,
+          isSponsored: isSponsoredCaption(caption),
+        };
+      })
+      .filter(p => p.creator !== 'unknown');
+
+    const allPosts = [...ttPosts, ...igPosts]
+      .sort((a, b) => (a.daysAgo ?? 9999) - (b.daysAgo ?? 9999));
+
+    // Unique creators
+    const creatorMap = {};
+    allPosts.forEach(p => {
+      const key = `${p.platform}:${p.creator}`;
+      if (!creatorMap[key]) {
+        creatorMap[key] = { platform: p.platform, creator: p.creator, followers: p.followers, posts: [] };
+      }
+      creatorMap[key].posts.push(p);
+    });
+
+    const creators = Object.values(creatorMap)
+      .map(c => ({
+        ...c,
+        postCount:   c.posts.length,
+        latestDaysAgo: Math.min(...c.posts.map(p => p.daysAgo ?? 9999)),
+        latestDate:  c.posts[0]?.date,
+        sponsoredCount: c.posts.filter(p => p.isSponsored).length,
+      }))
+      .sort((a, b) => a.latestDaysAgo - b.latestDaysAgo)
+      .slice(0, 20);
+
+    partnerships = {
+      totalPosts:   allPosts.length,
+      totalCreators: Object.keys(creatorMap).length,
+      sponsoredPosts: allPosts.filter(p => p.isSponsored).length,
+      recentPosts:  allPosts.slice(0, 10),
+      creators,
+    };
+  }
+
+  // ── Section 3: Social Profiles ──────────────────────────────────────────────
+  let socialProfiles = null;
+  {
+    const ig = igProfile?.data?.user || igProfile?.user || igProfile;
+    const tt = ttProfile?.user       || ttProfile?.userInfo?.user || ttProfile;
+    const ttStats = ttProfile?.stats || ttProfile?.userInfo?.stats || {};
+
+    socialProfiles = {
+      instagram: ig ? {
+        handle:     ig.username          || handle,
+        followers:  ig.edge_followed_by?.count || ig.follower_count || null,
+        following:  ig.edge_follow?.count      || ig.following_count || null,
+        posts:      ig.edge_owner_to_timeline_media?.count || ig.media_count || null,
+        bio:        ig.biography          || null,
+        verified:   ig.is_verified        || false,
+        category:   ig.category_name      || null,
+        website:    ig.external_url       || null,
+        profilePic: ig.profile_pic_url_hd || ig.profile_pic_url || null,
+      } : null,
+      tiktok: tt ? {
+        handle:     tt.uniqueId           || handle,
+        followers:  ttStats.followerCount || tt.followerCount || null,
+        following:  ttStats.followingCount || tt.followingCount || null,
+        likes:      ttStats.heartCount    || tt.heartCount     || null,
+        videos:     ttStats.videoCount    || tt.videoCount     || null,
+        bio:        tt.signature          || null,
+        verified:   tt.verified           || false,
+        profilePic: tt.avatarMedium       || tt.avatarLarger   || null,
+      } : null,
+    };
+  }
+
+  // ── Section 4: Google Ads ───────────────────────────────────────────────────
+  let googleAdsSection = null;
+  {
+    const raw = googleAds?.ads || googleAds?.results || [];
+    const ads = raw.slice(0, 10).map(ad => ({
+      id:          ad.creativeId || ad.id || String(Math.random()),
+      advertiser:  ad.advertiserName || ad.advertiser?.name || handle,
+      headline:    ad.headline || ad.title || null,
+      description: (ad.description || ad.body || '').slice(0, 160) || null,
+      format:      ad.adType || ad.format || 'Display',
+      startDate:   ad.firstShownDate || ad.start_date || null,
+      endDate:     ad.lastShownDate  || ad.end_date   || null,
+      regions:     ad.regions        || ad.countries  || [],
+      imageUrl:    ad.imageUrl       || ad.thumbnail  || null,
+    }));
+
+    googleAdsSection = {
+      totalAds: raw.length,
+      ads,
+    };
+  }
+
+  console.log(`[BRAND] Done — Meta:${metaAds.activeAds} ads | Partnerships:${partnerships.totalPosts} posts | Google:${googleAdsSection.totalAds} ads`);
+
+  return res.json({
+    handle,
+    metaAds,
+    partnerships,
+    socialProfiles,
+    googleAds: googleAdsSection,
+  });
+});
 
 module.exports = router;
