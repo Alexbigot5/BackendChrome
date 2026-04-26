@@ -3,6 +3,48 @@ const router = express.Router();
 const { pool } = require('../db');
 const { updateSheetHeaders } = require('../helpers/sheets');
 
+// ── GET /onboarding/fields ────────────────────────────────────
+// Called by the extension content script to fetch the user's saved
+// field preferences so the sidebar shows only the columns they picked.
+// Auth: x-livechrome-token header (the internal token stored in chrome.storage)
+router.get('/fields', async (req, res) => {
+  const token = req.headers['x-livechrome-token'];
+  if (!token) {
+    return res.status(400).json({ error: 'Missing x-livechrome-token header' });
+  }
+
+  try {
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE token = $1 AND active = true',
+      [token]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid or inactive token' });
+    }
+
+    const userId = userResult.rows[0].id;
+
+    const prefResult = await pool.query(
+      'SELECT fields FROM user_preferences WHERE user_id = $1',
+      [userId]
+    );
+
+    if (prefResult.rows.length === 0 || !prefResult.rows[0].fields) {
+      // No preferences saved yet — return sensible defaults
+      return res.json({
+        fields: ['followers', 'engagementRate', 'avgViews', 'avgLikes', 'avgComments', 'estimatedCpm'],
+      });
+    }
+
+    return res.json({ fields: prefResult.rows[0].fields });
+  } catch (err) {
+    console.error('[ONBOARDING/FIELDS] DB error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch fields' });
+  }
+});
+
+// ── POST /onboarding ──────────────────────────────────────────
 router.post('/', async (req, res) => {
   // Accept Clerk Bearer token (same as /provision)
   const authHeader = req.headers.authorization;
