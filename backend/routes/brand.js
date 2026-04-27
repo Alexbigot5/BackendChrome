@@ -218,17 +218,24 @@ router.post('/', authenticate, async (req, res) => {
       const snap = ad.snapshot || {};
       return {
         id:        ad.ad_archive_id || String(Math.random()),
-        title:     snap.title || snap.link_description || ad.page_name || pageName || handle,
+        title:     snap.cards?.[0]?.title || snap.title || snap.cards?.[0]?.link_description || snap.link_description || ad.page_name || pageName || handle,
         body:      (snap.body?.text || snap.caption || '').slice(0, 160) || null,
         platforms: (ad.publisher_platform || []).map(p => normPlatform(p)),
         format:    detectMetaFormat(snap),
         startDate: ts(ad.start_date),
         daysRunning: daysAgo(ad.start_date),
         ctaText:   snap.cta_text || null,
-        imageUrl:  snap.videos?.[0]?.video_preview_image_url
+        imageUrl:  snap.cards?.[0]?.original_image_url
+                || snap.cards?.[0]?.resized_image_url
                 || snap.images?.[0]?.resized_image_url
                 || snap.images?.[0]?.original_image_url
+                || snap.videos?.[0]?.video_preview_image_url
                 || null,
+        // For video ads: include video_hd_url or video_sd_url for playback
+        videoUrl:  snap.videos?.[0]?.video_hd_url
+                || snap.videos?.[0]?.video_sd_url
+                || null,
+        isVideo:   !!(snap.videos?.length || (snap.display_format || '').toUpperCase().includes('VIDEO')),
       };
     });
 
