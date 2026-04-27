@@ -346,21 +346,72 @@ router.post('/', authenticate, async (req, res) => {
       creatorMap[key].posts.push(p);
     });
 
+    const avg = (arr) => arr.length ? Math.round(arr.reduce((s, n) => s + n, 0) / arr.length) : 0;
+
     const creators = Object.values(creatorMap)
-      .map(c => ({
-        ...c,
-        postCount:   c.posts.length,
-        latestDaysAgo: Math.min(...c.posts.map(p => p.daysAgo ?? 9999)),
-        latestDate:  c.posts[0]?.date,
-        sponsoredCount: c.posts.filter(p => p.isSponsored).length,
-      }))
+      .map(c => {
+        const sponsored = c.posts.filter(p => p.isSponsored);
+        const allViews  = c.posts.map(p => p.views).filter(v => v > 0);
+        const allLikes  = c.posts.map(p => p.likes).filter(l => l > 0);
+        const spViews   = sponsored.map(p => p.views).filter(v => v > 0);
+        const spLikes   = sponsored.map(p => p.likes).filter(l => l > 0);
+        // Most recent sponsored post date
+        const spSorted  = sponsored
+          .filter(p => p.daysAgo != null)
+          .sort((a, b) => a.daysAgo - b.daysAgo);
+        return {
+          platform:        c.platform,
+          creator:         c.creator,
+          followers:       c.followers,
+          postCount:       c.posts.length,
+          sponsoredCount:  sponsored.length,
+          latestDaysAgo:   Math.min(...c.posts.map(p => p.daysAgo ?? 9999)),
+          latestDate:      c.posts[0]?.date,
+          lastSponsoredDaysAgo: spSorted[0]?.daysAgo ?? null,
+          lastSponsoredDate:    spSorted[0]?.date    ?? null,
+          avgViews:        avg(allViews),
+          avgLikes:        avg(allLikes),
+          avgViewsSponsored: avg(spViews),
+          avgLikesSponsored: avg(spLikes),
+        };
+      })
       .sort((a, b) => a.latestDaysAgo - b.latestDaysAgo)
       .slice(0, 20);
 
+    // Sponsored-only aggregate stats
+    const sponsoredPosts   = allPosts.filter(p => p.isSponsored);
+    const sponsoredPct     = allPosts.length
+      ? Math.round((sponsoredPosts.length / allPosts.length) * 100)
+      : 0;
+    const spViewsList      = sponsoredPosts.map(p => p.views).filter(v => v > 0);
+    const spLikesList      = sponsoredPosts.map(p => p.likes).filter(l => l > 0);
+    const mostRecentSp     = sponsoredPosts
+      .filter(p => p.daysAgo != null)
+      .sort((a, b) => a.daysAgo - b.daysAgo)[0] || null;
+
+    // Platform split
+    const ttPosts2  = allPosts.filter(p => p.platform === 'tiktok');
+    const igPosts2  = allPosts.filter(p => p.platform === 'instagram');
+    const ttSpCount = ttPosts2.filter(p => p.isSponsored).length;
+    const igSpCount = igPosts2.filter(p => p.isSponsored).length;
+
     partnerships = {
-      totalPosts:   allPosts.length,
-      totalCreators: Object.keys(creatorMap).length,
-      sponsoredPosts: allPosts.filter(p => p.isSponsored).length,
+      totalPosts:          allPosts.length,
+      totalCreators:       Object.keys(creatorMap).length,
+      sponsoredPosts:      sponsoredPosts.length,
+      sponsoredPct,
+      avgViewsSponsored:   avg(spViewsList),
+      avgLikesSponsored:   avg(spLikesList),
+      mostRecentSponsored: mostRecentSp ? {
+        creator:  mostRecentSp.creator,
+        platform: mostRecentSp.platform,
+        daysAgo:  mostRecentSp.daysAgo,
+        date:     mostRecentSp.date,
+      } : null,
+      platformSplit: {
+        tiktok:    { total: ttPosts2.length,  sponsored: ttSpCount },
+        instagram: { total: igPosts2.length, sponsored: igSpCount },
+      },
       recentPosts:  allPosts.slice(0, 10),
       creators,
     };
